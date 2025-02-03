@@ -239,49 +239,46 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
     //const int32_t thread_bag = packed_bag_idx_L * bag_size_offset * NumUint4LoadsPerRow + packed_bag_idx_D * uint4_loads_per_row;
     input_rows_in_flight = shfl_sync(input_rows_in_flight, packed_bag_idx_D * uint4_loads_per_row); //threadId of the bagId
     
-    #pragma unroll OutputRowsPerThread
-    for(uint32_t i = 0; i < OutputRowsPerThread; ++i)
-    {
-       for(uint32_t k = 0; k < num_packed_bag_L ; ++k){
 
+      for(uint32_t k = 0; k < num_packed_bag_L ; ++k){
         //Ls[i] = shfl_sync(Ls[i], threadIdx.x / uints_per_row % num_packed_bags_D * uint4_loads_per_row);
-         Ls_n[i*num_packed_bag_L+k] = shfl_sync(Ls[i], k * bag_size_offset * NumUint4LoadsPerRow + packed_bag_idx_D * uint4_loads_per_row);
+         Ls_shfl[i] = shfl_sync(Ls[i], k * bag_size_offset * NumUint4LoadsPerRow + packed_bag_idx_D * uint4_loads_per_row);
+        for (uint32_t input_row_idx = 0; input_row_idx < input_rows_in_flight; ++input_row_idx) {
+     
+        #pragma unroll OutputRowsPerThread
+        for (uint32_t i = 0; i < OutputRowsPerThread; ++i) {
+          bool valid = L_start + input_row_idx < Ls_shfl[i];
+          if (!valid) {
+            continue;
+          }
+          const uint32_t* row = reinterpret_cast<const uint32_t*>(&buffers[warp_idx][i][k*bag_size_offset*input_row_idx][0]);
 
-     }
-    }
-    
-    for (uint32_t input_row_idx = 0; input_row_idx < input_rows_in_flight; ++input_row_idx) {
-      #pragma unroll OutputRowsPerThread
-      for (uint32_t i = 0; i < OutputRowsPerThread; ++i) {
-        bool valid = L_start + input_row_idx < Ls[i];
-        if (!valid) {
-          continue;
-        }
-        const uint32_t* row = reinterpret_cast<const uint32_t*>(&buffers[warp_idx][i][input_row_idx][0]);
-
-        // scale and bias are at the beginning of each row.
-        // rationale: have scale/shift at start since these get loaded first
-        // and then broadcasted around so it might speed up the first cache miss.
-        {% if emb_weight_type.primitive_type == "INT" %}
-        half2 shift_scale = reinterpret_cast<const half2*>(row)[packed_bag_idx_D * uints_per_row];
-        {% endif %}
-
-        {% if weighted %}
-        float row_weight = buffers_indice_weights[warp_idx][i][input_row_idx];
-        {% endif %}
-
-        using scalar_t = {{ emb_weight_type.cpp_type_name }};
-
-        {% if not nobag %}
-        #pragma unroll MaxNum128BRows
-        for (uint32_t j = 0; j < MaxNum128BRows; ++j) {
-          scalar_t v = reinterpret_cast<const scalar_t*>(row)[kWarpSize * j + threadIdx.x];
-          {% if weighted %}
-          accumulators[i][j].fma(v, {% if emb_weight_type.primitive_type == "INT" %} shift_scale, {% elif emb_weight_type.enum_name == "FP8" %} exponent_bits, exponent_bias, {% endif %} row_weight);
-          {% else %}
-          accumulators[i][j].add(v{% if emb_weight_type.primitive_type == "INT" %}, shift_scale {% elif emb_weight_type.enum_name == "FP8" %}, exponent_bits, exponent_bias {% endif %});
+          // scale and bias are at the beginning of each row.
+          // rationale: have scale/shift at start since these get loaded first
+          // and then broadcasted around so it might speed up the first cache miss.
+          {% if emb_weight_type.primitive_type == "INT" %}
+          half2 shift_scale = reinterpret_cast<const half2*>(row)[packed_bag_idx_D * uints_per_row];
           {% endif %}
-        }
+
+          {% if weighted %}
+          float row_weight = buffers_indice_weights[warp_idx][i][input_row_idx];
+          {% endif %}
+
+          using scalar_t = {{ emb_weight_type.cpp_type_name }};
+
+          {% if not nobag %}
+          #pragma unroll MaxNum128BRows
+          for (uint32_t j = 0; j < MaxNum128BRows; ++j) {
+
+            scalar_t v = reinterpret_cast<const scalar_t*>(row)[kWarpSize * j + threadIdx.x];
+
+            {% if weighted %}
+            accumulators[i][j].fma(v, {% if emb_weight_type.primitive_type == "INT" %} shift_scale, {% elif emb_weight_type.enum_name == "FP8" %} exponent_bits, exponent_bias, {% endif %} row_weight);
+            {% else %}
+            accumulators[i][j].add(v{% if emb_weight_type.primitive_type == "INT" %}, shift_scale {% elif emb_weight_type.enum_name == "FP8" %}, exponent_bits, exponent_bias {% endif %});
+            {% endif %}
+          }
+      } //end of for loop over k
         {% else %}
         const int32_t output_j = indices_starts[i] + L_start + input_row_idx;
         if constexpr (std::is_same_v<output_t, float> || std::is_same_v<output_t, at::Half> || std::is_same_v<output_t, at::BFloat16>) {
